@@ -28,6 +28,11 @@ API_KEY = "Dummy"
 TO_MS = 1000
 DEFAULT_BASE_URL = "http://127.1.1.1:8000/v1"
 DEFAULT_MAX_TOKENS = 128
+DEFAULT_INPUT_TOKENS = 128
+MAX_INPUT_TOKENS = 131072
+MAX_OUTPUT_TOKENS = 32768
+OUTPUT_HINT = "Your answer must contain at least 128 tokens."
+FALLBACK_CHARS_PER_TOKEN = 4.0
 DEFAULT_CONCURRENCY_LEVELS = [1, 2, 4, 8]
 MEASURED_ROUNDS = 10
 WARMUP_ROUNDS = 1
@@ -109,7 +114,8 @@ class LLMBenchmark:
     A class for benchmarking LLM models with various performance metrics.
     """
 
-    def __init__(self, base_url: str, api_key: str, model: str):
+    def __init__(self, base_url: str, api_key: str, model: str,
+                 force_output_length: bool = False):
         """
         Initialize the benchmark client.
 
@@ -117,10 +123,14 @@ class LLMBenchmark:
             base_url: The base URL of the API server
             api_key: The API key for authentication
             model: The model name to benchmark
+            force_output_length: Ask the server to generate exactly max_tokens
+                (ignore_eos + min_tokens; supported by vLLM and SGLang)
         """
         self.base_url = base_url.rstrip('/')
         self.api_key = api_key
         self.model = model
+        self.force_output_length = force_output_length
+        self.target_chars = None
 
         self._build_client(read_timeout=300.0)
 
@@ -181,6 +191,7 @@ class LLMBenchmark:
         last_token_time = None
         tokens = 0
         total_tokens = 0
+        prompt_tokens = 0
         total_content = []
         chunk_count = 0
 
@@ -188,13 +199,19 @@ class LLMBenchmark:
             # Streaming completion with explicit timeout
             logger.info(f"Starting completion for model: {self.model}")
 
+            # Only sent when requested, so default requests stay unchanged
+            extra = {}
+            if self.force_output_length:
+                extra["extra_body"] = {"ignore_eos": True, "min_tokens": max_tokens}
+
             # Create stream with timeout
             stream = self.client.chat.completions.create(
                 model=self.model,
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=max_tokens,
                 stream=True,
-                stream_options={"include_usage": True}
+                stream_options={"include_usage": True},
+                **extra
             )
 
             # Process stream with chunk timeout protection
@@ -236,6 +253,7 @@ class LLMBenchmark:
                 # Get usage information if available
                 if hasattr(event, 'usage') and event.usage is not None:
                     total_tokens = event.usage.completion_tokens
+                    prompt_tokens = event.usage.prompt_tokens or 0
                     logger.debug(f"Token count: {total_tokens}")
 
             logger.info(f"Stream completed. Chunks: {chunk_count}, Tokens: {total_tokens}")
@@ -278,6 +296,7 @@ class LLMBenchmark:
             "tps": tps,
             "latency": latency,
             "tokens": tokens,
+            "prompt_tokens": prompt_tokens,
             "content": content,
         }
 
@@ -390,6 +409,10 @@ class LLMBenchmark:
 
         error_count = len(results) - len(valid_results)
 
+        # Token counts actually sent/received (prompt_tokens is 0 when the
+        # server does not report usage)
+        prompt_counts = [r['prompt_tokens'] for r in valid_results if r.get('prompt_tokens')]
+
         return {
             "TTFT": calculate_percentiles(ttfts),
             "ITL": calculate_percentiles(itls),
@@ -402,6 +425,10 @@ class LLMBenchmark:
                 "total": len(results),
                 # Percentage of failed requests at this concurrency level.
                 "error_rate": (error_count / len(results) * 100.0) if results else 0.0,
+            },
+            "Tokens": {
+                "input_mean": statistics.mean(prompt_counts) if prompt_counts else None,
+                "output_mean": statistics.mean(r['tokens'] for r in valid_results),
             },
         }
 
@@ -480,8 +507,33 @@ class LLMBenchmark:
 
         return figures
 
+    def size_input(self, prompt: str, filler_pool: List[str],
+                   input_tokens: int) -> Optional[int]:
+        """
+        Find the prompt length in characters that gives input_tokens prompt
+        tokens on this server (its tokenizer and chat template).
+
+        Two short requests, the bare prompt and a padded one, give a
+        straight-line fit of usage.prompt_tokens against characters.
+
+        Returns:
+            Target prompt length in characters, or None if the server does
+            not report prompt_tokens
+        """
+        guess = max(int(input_tokens * FALLBACK_CHARS_PER_TOKEN), 2 * len(prompt))
+        padded = pad_prompt(prompt, filler_pool, guess, random.Random(0))
+
+        short_tokens = self.measure_single(prompt, 16).get("prompt_tokens", 0)
+        long_tokens = self.measure_single(padded, 16).get("prompt_tokens", 0)
+        if not short_tokens or long_tokens <= short_tokens:
+            return None
+
+        chars_per_token = (len(padded) - len(prompt)) / (long_tokens - short_tokens)
+        return int(len(prompt) + (input_tokens - short_tokens) * chars_per_token)
+
     async def run(self, prompts: List[str], max_tokens: int,
-                  concurrency_levels: List[int]) -> Dict:
+                  concurrency_levels: List[int],
+                  input_tokens: int = DEFAULT_INPUT_TOKENS) -> Dict:
         """
         Run the complete benchmark suite.
 
@@ -489,6 +541,8 @@ class LLMBenchmark:
             prompts: List of prompts to test
             max_tokens: Maximum tokens per response
             concurrency_levels: List of concurrency levels to test
+            input_tokens: Target prompt tokens per request; the default sends
+                prompts.txt unchanged, larger values pad every prompt
 
         Returns:
             Dictionary containing all benchmark results
@@ -500,8 +554,34 @@ class LLMBenchmark:
         self.measure_single("What is warmup?", 32)
         st.write("Warm Up Ended ...")
 
+        # Workload: at the default 128/128 the prompts go out unchanged
+        filler_pool = [p.replace(OUTPUT_HINT, "").strip() for p in prompts]
+        if max_tokens != DEFAULT_MAX_TOKENS:
+            prompts = [set_output_hint(p, max_tokens) for p in prompts]
+
+        target_chars = None
+        if input_tokens != DEFAULT_INPUT_TOKENS and prompts:
+            st.write(f"Sizing prompts to {input_tokens} input tokens ...")
+            target_chars = self.size_input(prompts[0], filler_pool, input_tokens)
+            if target_chars is None:
+                target_chars = int(input_tokens * FALLBACK_CHARS_PER_TOKEN)
+                st.warning(
+                    f"Server did not report prompt_tokens; assuming "
+                    f"{FALLBACK_CHARS_PER_TOKEN:.0f} characters per token."
+                )
+            st.write(f"Prompts padded to {target_chars} characters")
+        self.target_chars = target_chars
+
+        rng = random.Random()
+
+        def make_batch(n: int) -> List[str]:
+            batch = take_prompts(prompts, n)
+            if target_chars is None:
+                return batch
+            return [pad_prompt(p, filler_pool, target_chars, rng) for p in batch]
+
         st.write("Calibrating with a single representative request ...")
-        calib = self.measure_single(prompts[0], max_tokens) if prompts else {"error": "no prompts"}
+        calib = self.measure_single(make_batch(1)[0], max_tokens) if prompts else {"error": "no prompts"}
         if "error" in calib:
             calib_latency = 10.0
             calib_ttft_s = 5.0
@@ -538,11 +618,7 @@ class LLMBenchmark:
             # would time out and discard whole levels (e.g. 128 -> 256).
             slack = 3.0 + conc / 128.0
 
-            warmup_needed = WARMUP_ROUNDS * conc
-            if warmup_needed <= len(prompts):
-                warmup_batch = prompts[:warmup_needed]
-            else:
-                warmup_batch = [prompts[i % len(prompts)] for i in range(warmup_needed)]
+            warmup_batch = make_batch(WARMUP_ROUNDS * conc)
 
             warmup_timeout = max(300.0, WARMUP_ROUNDS * prev_latency * slack)
             logger.info(
@@ -560,11 +636,7 @@ class LLMBenchmark:
                     f"Proceeding with measurement."
                 )
 
-            needed = MEASURED_ROUNDS * conc
-            if needed <= len(prompts):
-                batch = prompts[:needed]
-            else:
-                batch = [prompts[i % len(prompts)] for i in range(needed)]
+            batch = make_batch(MEASURED_ROUNDS * conc)
 
             batch_timeout = max(300.0, MEASURED_ROUNDS * prev_latency * slack)
             st.write(
@@ -630,8 +702,47 @@ def load_prompts() -> List[str]:
         return []
 
 
+def take_prompts(prompts: List[str], n: int) -> List[str]:
+    """First n prompts, cycling through the list when n exceeds it."""
+    if n <= len(prompts):
+        return prompts[:n]
+    return [prompts[i % len(prompts)] for i in range(n)]
+
+
+def set_output_hint(prompt: str, output_tokens: int) -> str:
+    """Point the prompt's length instruction at the chosen output length."""
+    return prompt.replace(
+        OUTPUT_HINT, f"Your answer must contain at least {output_tokens} tokens."
+    )
+
+
+def pad_prompt(prompt: str, filler_pool: List[str], target_chars: int,
+               rng: random.Random) -> str:
+    """
+    Extend a prompt to target_chars with background text drawn from the
+    other prompts.
+
+    The question stays first and the filler order is drawn fresh on every
+    call, so requests do not share a long prefix that a server's prefix
+    cache could serve without prefill.
+    """
+    if len(prompt) >= target_chars:
+        return prompt
+
+    parts = [prompt, "", "Background notes (for reference only):"]
+    length = sum(len(p) + 1 for p in parts)
+    while length < target_chars:
+        for item in rng.sample(filler_pool, len(filler_pool)):
+            parts.append(item)
+            length += len(item) + 1
+            if length >= target_chars:
+                break
+    return "\n".join(parts)[:target_chars]
+
+
 def build_zip(model_name: str, df: pd.DataFrame, figures: Dict[str, go.Figure],
-              models_payload: Optional[Dict] = None) -> bytes:
+              models_payload: Optional[Dict] = None,
+              run_config: Optional[Dict] = None) -> bytes:
     zip_buffer = io.BytesIO()
     
     with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
@@ -658,6 +769,9 @@ def build_zip(model_name: str, df: pd.DataFrame, figures: Dict[str, go.Figure],
                 zip_file.writestr("models.json", models_buffer.getvalue())
             except Exception as e:
                 logger.error(f"Error saving models.json: {e}")
+
+        if run_config:
+            zip_file.writestr("config.json", json.dumps(run_config, indent=2))
     
     zip_buffer.seek(0)
     return zip_buffer.getvalue()
@@ -701,6 +815,31 @@ def calculate_capacity(all_metrics: Dict, ttft_slo: int, tps_slo: int,
     }
 
 
+def fmt_tokens(value: Optional[float]) -> str:
+    """Token count for the results table; n/a when the server sent no usage."""
+    return f"{value:.0f}" if value is not None else "n/a"
+
+
+def build_run_config(model: str, input_tokens: int, output_tokens: int,
+                     force_output_length: bool, concurrency_levels: List[int],
+                     target_chars: Optional[int], all_metrics: Dict) -> Dict:
+    """Workload settings and measured token counts, saved as config.json."""
+    return {
+        "model": model,
+        "input_tokens": input_tokens,
+        "input_mode": "prompts.txt" if target_chars is None else "padded",
+        "prompt_chars": target_chars,
+        "output_tokens": output_tokens,
+        "force_output_length": force_output_length,
+        "concurrency_levels": sorted(concurrency_levels),
+        "measured_rounds": MEASURED_ROUNDS,
+        "warmup_rounds": WARMUP_ROUNDS,
+        "measured_tokens": {
+            str(conc): metrics["Tokens"] for conc, metrics in all_metrics.items()
+        },
+    }
+
+
 def create_results_dataframe(all_metrics: Dict) -> pd.DataFrame:
     """
     Create a DataFrame from benchmark results.
@@ -730,7 +869,9 @@ def create_results_dataframe(all_metrics: Dict) -> pd.DataFrame:
                 "Latency (p90, s)": f"{metrics['Latency']['p90']:.2f}",
                 "Throughput (RPS)": f"{metrics['Throughput (RPS)']:.2f}",
                 "Valid Requests": f"{metrics['Requests']['valid']}/{metrics['Requests']['total']}",
-                "Error Rate (%)": f"{metrics['Requests']['error_rate']:.2f}"
+                "Error Rate (%)": f"{metrics['Requests']['error_rate']:.2f}",
+                "Input Tokens (Mean)": fmt_tokens(metrics['Tokens']['input_mean']),
+                "Output Tokens (Mean)": fmt_tokens(metrics['Tokens']['output_mean']),
             })
     return pd.DataFrame(data)
 
@@ -842,6 +983,26 @@ def main() -> None:
         default=DEFAULT_CONCURRENCY_LEVELS
     )
 
+    with st.sidebar.expander("Workload (tokens)", expanded=False):
+        input_tokens = st.number_input(
+            "Input tokens", min_value=DEFAULT_INPUT_TOKENS,
+            max_value=MAX_INPUT_TOKENS, value=DEFAULT_INPUT_TOKENS, step=128,
+            help="128 sends the standard prompts.txt set unchanged. Larger "
+                 "values pad every prompt to that many prompt tokens, sized "
+                 "on the server's tokenizer."
+        )
+        output_tokens = st.number_input(
+            "Output tokens", min_value=1, max_value=MAX_OUTPUT_TOKENS,
+            value=DEFAULT_MAX_TOKENS, step=128,
+            help="max_tokens per request."
+        )
+        force_output_length = st.checkbox(
+            "Force exact output length", value=False,
+            help="Sends ignore_eos and min_tokens so every response is "
+                 "exactly the output length. Supported by vLLM and SGLang; "
+                 "other servers may reject the request."
+        )
+
     ttft_slo = DEFAULT_TTFT_SLO
     tps_slo = DEFAULT_TPS_SLO
     percentile_key = "p90"
@@ -875,6 +1036,7 @@ def main() -> None:
         else:
             if 'sonuc' in st.session_state:
                 del st.session_state.sonuc
+            st.session_state.pop('zip_data', None)
 
             with st.spinner("Running benchmark..."):
                 prompts = load_prompts()
@@ -882,16 +1044,27 @@ def main() -> None:
                     st.error("Could not load prompts. Please check the prompts.txt file.")
                 else:
                     try:
-                        benchmark = LLMBenchmark(base_url, api_key, model)
+                        benchmark = LLMBenchmark(base_url, api_key, model,
+                                                 force_output_length)
                         all_metrics = asyncio.run(
-                            benchmark.run(prompts, DEFAULT_MAX_TOKENS, concurrency_levels)
+                            benchmark.run(prompts, output_tokens, concurrency_levels,
+                                          input_tokens)
                         )
 
                         if all_metrics:
                             df = create_results_dataframe(all_metrics)
                             figures = benchmark.plot_results(all_metrics)
                             model_name = model.split('/')[-1] if model else "unknown"
-                            st.session_state.sonuc = (model_name, df, figures, all_metrics)
+                            # Default runs keep their file names
+                            if (input_tokens, output_tokens) != (DEFAULT_INPUT_TOKENS, DEFAULT_MAX_TOKENS):
+                                model_name += f"_in{input_tokens}_out{output_tokens}"
+                            run_config = build_run_config(
+                                model, input_tokens, output_tokens,
+                                force_output_length, concurrency_levels,
+                                benchmark.target_chars, all_metrics
+                            )
+                            st.session_state.sonuc = (model_name, df, figures,
+                                                      all_metrics, run_config)
                         else:
                             st.error("No benchmark results were generated.")
                     except Exception as e:
@@ -899,9 +1072,15 @@ def main() -> None:
                         st.error(f"Benchmark failed: {e}")
 
     if 'sonuc' in st.session_state:
-        model_name, df, figures, all_metrics = st.session_state.sonuc
+        model_name, df, figures, all_metrics, run_config = st.session_state.sonuc
 
         st.subheader("Benchmark Results")
+        st.caption(
+            f"Workload: {run_config['input_tokens']} input / "
+            f"{run_config['output_tokens']} output tokens"
+            + (" (forced)" if run_config['force_output_length'] else "")
+            + " — measured counts are in the last two columns"
+        )
         st.dataframe(df, width='stretch')
 
         cap = calculate_capacity(all_metrics, ttft_slo, tps_slo, percentile_key, think_time)
@@ -930,12 +1109,12 @@ def main() -> None:
         for metric, fig in figures.items():
             st.plotly_chart(fig, use_container_width=True)
 
-        if 'zip_data' not in st.session_state or st.session_state.get('zip_model') != model_name:
+        # Built once per run; cleared when a new run starts
+        if 'zip_data' not in st.session_state:
             st.session_state.zip_data = build_zip(
                 model_name, df, figures,
-                st.session_state.get('models_payload')
+                st.session_state.get('models_payload'), run_config
             )
-            st.session_state.zip_model = model_name
 
         st.sidebar.markdown("---")
         st.sidebar.download_button(

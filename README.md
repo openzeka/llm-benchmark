@@ -17,7 +17,8 @@ An interactive Streamlit application for benchmarking LLM inference servers with
 - **Comprehensive Metrics** — TTFT, ITL, TPS, Latency, and Throughput with Mean/P50/P90 percentiles, plus valid/failed request counts per level
 - **SLO-Driven Capacity Planning** — Determine max concurrency and total users based on configurable TTFT/TPS thresholds using Little's Law
 - **Interactive Visualizations** — Grouped bar charts (Mean vs P90) for all metrics via Plotly
-- **One-Click Download** — Export all results as a ZIP archive containing CSV tables, PNG charts, interactive HTML plots, and the raw `models.json` payload from the server
+- **Custom Workload** — Optionally set the input and output token counts per request (default 128 / 128)
+- **One-Click Download** — Export all results as a ZIP archive containing CSV tables, PNG charts, interactive HTML plots, the raw `models.json` payload from the server, and the run's `config.json`
 - **Streaming API** — Uses streaming completions with `include_usage` for accurate token counting; supports `reasoning_content` from reasoning models
 - **Warm-Up Mechanism** — Automatically sends a warm-up request before benchmarking to stabilize inference performance
 
@@ -45,13 +46,14 @@ docker run -p 8501:8501 --add-host=host.docker.internal:host-gateway llm-benchma
 2. Click **Refresh Models** to fetch available models from the server
 3. Select a **Model** from the dropdown
 4. Choose **Concurrency Levels** to test (e.g., 1, 2, 4, 8)
-5. Click **Run Benchmark**
-6. View results in the main area:
+5. Optionally open **Workload (tokens)** to change the input and output length (default 128 / 128, see [Custom Workload](#custom-workload))
+6. Click **Run Benchmark**
+7. View results in the main area:
    - **Benchmark Results** table with all metrics
    - **Capacity Planning** (click to expand) with SLO pass/fail analysis
    - **Visualizations** with Mean vs P90 grouped bar charts
-7. Adjust **TTFT SLO**, **TPS SLO**, **Percentile**, and **Think Time** in the sidebar to recalculate capacity planning in real time
-8. Click **Download All Results (ZIP)** in the sidebar to export
+8. Adjust **TTFT SLO**, **TPS SLO**, **Percentile**, and **Think Time** in the sidebar to recalculate capacity planning in real time
+9. Click **Download All Results (ZIP)** in the sidebar to export
 
 ## Metrics
 
@@ -77,7 +79,22 @@ Each metric is reported with **Mean**, **P50** (median), and **P90** (90th perce
 | Warmup rounds per concurrency | 1 | Each concurrency level runs 1 warmup round (`WARMUP_ROUNDS`); results discarded |
 | Total requests per level | 11 × concurrency | e.g., concurrency=8 → 88 requests (8 warmup + 80 measured) |
 
-Both input and output are approximately 128 tokens, creating a consistent and reproducible benchmark workload.
+Both input and output are approximately 128 tokens, creating a consistent and reproducible benchmark workload. These are the defaults; see [Custom Workload](#custom-workload) to change them.
+
+### Custom Workload
+
+The **Workload (tokens)** section in the sidebar sets the input and output length of every request. At the default 128 / 128 the tool behaves exactly as before: `prompts.txt` is sent unchanged and requests carry the same fields.
+
+| Setting | Default | Effect |
+|---------|---------|--------|
+| Input tokens | 128 | 128 sends `prompts.txt` unchanged. Larger values pad every prompt to that many prompt tokens |
+| Output tokens | 128 | `max_tokens` per request; the prompts' "at least N tokens" instruction follows it |
+| Force exact output length | Off | Sends `ignore_eos` and `min_tokens` so every response is exactly the output length. Supported by vLLM and SGLang; other servers may reject the request |
+
+- **Sizing**: before the run, two short requests (the bare prompt and a padded one) fit `usage.prompt_tokens` against prompt length on the server's own tokenizer and chat template. If the server does not report usage, 4 characters per token is assumed.
+- **Padding**: each prompt keeps its question first, followed by background text drawn from the other prompts in a fresh order for every request, so requests do not share a long prefix that the server's prefix cache could serve without prefill.
+- **Measured counts**: the results table ends with **Input Tokens (Mean)** and **Output Tokens (Mean)**, taken from the server's `usage`. Without *Force exact output length*, a model may stop before the output length; the output column shows when it did.
+- **Files**: runs other than 128 / 128 add `_in{input}_out{output}` to the file names. Every ZIP includes `config.json` with the workload settings and the measured token counts per concurrency level.
 
 ### Methodology Notes
 
@@ -154,7 +171,8 @@ Constants can be modified at the top of `benchmark.py`:
 | Constant | Default | Description |
 |----------|---------|-------------|
 | `DEFAULT_BASE_URL` | `http://127.0.1.1:8000/v1` | Default API endpoint |
-| `DEFAULT_MAX_TOKENS` | 128 | Max tokens per completion |
+| `DEFAULT_MAX_TOKENS` | 128 | Default output tokens (max tokens per completion) |
+| `DEFAULT_INPUT_TOKENS` | 128 | Default input tokens; this value sends `prompts.txt` unchanged |
 | `DEFAULT_CONCURRENCY_LEVELS` | [1, 2, 4, 8] | Concurrency levels to test |
 | `MEASURED_ROUNDS` | 10 | Measured rounds per concurrency level |
 | `WARMUP_ROUNDS` | 1 | Warmup rounds per concurrency level (results discarded) |
