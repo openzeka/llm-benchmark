@@ -18,7 +18,7 @@ An interactive Streamlit application for benchmarking LLM inference servers with
 - **SLO-Driven Capacity Planning** — Determine max concurrency and total users based on configurable TTFT/TPS thresholds using Little's Law
 - **Interactive Visualizations** — Grouped bar charts (Mean vs P90) for all metrics via Plotly
 - **Custom Workload** — Optionally set the input and output token counts per request (default 128 / 128)
-- **One-Click Download** — Export all results as a ZIP archive containing CSV tables, PNG charts, interactive HTML plots, the raw `models.json` payload from the server, and the run's `config.json`
+- **One-Click Download** — Export all results as a ZIP archive containing CSV tables, PNG charts, interactive HTML plots, the raw `models.json` payload from the server, the run's `config.json`, and a per-request CSV
 - **Streaming API** — Uses streaming completions with `include_usage` for accurate token counting; supports `reasoning_content` from reasoning models
 - **Warm-Up Mechanism** — Automatically sends a warm-up request before benchmarking to stabilize inference performance
 
@@ -61,7 +61,8 @@ docker run -p 8501:8501 --add-host=host.docker.internal:host-gateway llm-benchma
 |--------|------|-------------|
 | **TTFT** | ms | Time To First Token — delay from request to first generated token |
 | **ITL** | ms | Inter-Token Latency — average time between consecutive tokens |
-| **TPS** | tokens/s | Tokens Per Second — output generation speed |
+| **TPS** | tokens/s | Tokens Per Second — output tokens ÷ total request time, so it includes the TTFT wait |
+| **Decode TPS** | tokens/s | Generation speed without the TTFT wait: `1000 / mean ITL` |
 | **Latency** | s | Total request latency from start to finish |
 | **Throughput** | RPS | Requests Per Second — computed as `num_requests / sum(latencies)`, i.e. `1 / mean latency`. This is the per-stream completion rate at the given concurrency, **not** the aggregate system throughput |
 | **Error Rate** | % | Percentage of failed requests (timeouts, connection errors, empty responses) at the given concurrency level |
@@ -72,7 +73,7 @@ Each metric is reported with **Mean**, **P50** (median), and **P90** (90th perce
 
 | Parameter | Value | Description |
 |----------|-------|-------------|
-| Prompt count | 100 | Diverse prompts loaded from `prompts.txt` (auto-shuffled each run) |
+| Prompt count | 100 | Diverse prompts loaded from `prompts.txt`, shuffled with the run's seed |
 | Prompt length | ~128 tokens | Each prompt explicitly requests at least 128 tokens |
 | Max output tokens | 128 | Responses truncated after 128 tokens (`DEFAULT_MAX_TOKENS`) |
 | Measured rounds per concurrency | 10 | Each concurrency level runs 10 measured rounds (`MEASURED_ROUNDS`) |
@@ -83,22 +84,25 @@ Both input and output are approximately 128 tokens, creating a consistent and re
 
 ### Custom Workload
 
-The **Workload (tokens)** section in the sidebar sets the input and output length of every request. At the default 128 / 128 the tool behaves exactly as before: `prompts.txt` is sent unchanged and requests carry the same fields.
+The **Workload (default: 128 in / 128 out)** section in the sidebar sets the input and output length of every request. At the default 128 in / 128 out, the prompts from `prompts.txt` are sent as they are, each with its request tag (see [Methodology Notes](#methodology-notes)).
 
 | Setting | Default | Effect |
 |---------|---------|--------|
-| Input tokens | 128 | 128 sends `prompts.txt` unchanged. Larger values pad every prompt to that many prompt tokens |
-| Output tokens | 128 | `max_tokens` per request; the prompts' "at least N tokens" instruction follows it |
-| Force exact output length | Off | Sends `ignore_eos` and `min_tokens` so every response is exactly the output length. Supported by vLLM and SGLang; other servers may reject the request |
+| Input tokens | 128 | Rounded up to a multiple of 128. 128 sends `prompts.txt` unchanged. Larger values pad every prompt to that many prompt tokens |
+| Output tokens | 128 | Any value. `max_tokens` per request; the prompts' "at least N tokens" instruction follows it |
+| Force exact output length | On | Sends `ignore_eos` and `min_tokens` so every response is exactly the output length. Supported by vLLM and SGLang; untick it for a server that rejects the request |
 
 - **Sizing**: before the run, two short requests (the bare prompt and a padded one) fit `usage.prompt_tokens` against prompt length on the server's own tokenizer and chat template. If the server does not report usage, 4 characters per token is assumed.
-- **Padding**: each prompt keeps its question first, followed by background text drawn from the other prompts in a fresh order for every request, so requests do not share a long prefix that the server's prefix cache could serve without prefill.
+- **Padding**: each prompt keeps its question first, followed by the other prompts in a seeded random order that is fresh for every request, cut at the measured length, so requests do not share a long prefix that the server's prefix cache could serve without prefill.
 - **Measured counts**: the results table ends with **Input Tokens (Mean)** and **Output Tokens (Mean)**, taken from the server's `usage`. Without *Force exact output length*, a model may stop before the output length; the output column shows when it did.
-- **Files**: runs other than 128 / 128 add `_in{input}_out{output}` to the file names. Every ZIP includes `config.json` with the workload settings and the measured token counts per concurrency level.
+- **Files**: runs other than 128 / 128 add `_in{input}_out{output}` to the file names. Every ZIP includes `config.json` with the workload settings and the measured token counts per concurrency level, and `<model>-requests.csv` with one row per measured request (start time, TTFT, ITL, TPS, decode TPS, latency, token counts, error).
 
 ### Methodology Notes
 
-- **Retries**: each request allows at most 1 transport-level retry (`MAX_RETRIES`). Successful requests include any retry time in their measured latency; failed requests are counted in the error rate instead of being silently retried indefinitely.
+- **Retries**: none (`MAX_RETRIES = 0`). A silently retried request would carry the failed attempt and the retry back-off in its TTFT, so a failed request is counted in the error rate instead.
+- **Stalled streams**: a stream that sends nothing for longer than the chunk timeout is counted as an error, not as a valid request with too few tokens.
+- **No prefix-cache hits**: `prompts.txt` has 100 prompts, so a run sends each of them many times. Every request therefore starts with a tag unique to the run and the request (e.g. `[3fa9c1-00042]`), so the server's prefix cache cannot serve a prompt it has already seen, earlier in the run or in an earlier run, without prefill. The tag adds about 8 tokens; for longer inputs it is counted in the target length.
+- **Timing**: request times use a monotonic clock (`time.perf_counter`), so a system clock adjustment cannot corrupt a sample.
 - **Timeout policy**: each concurrency level runs with a wall-clock budget of `rounds × previous_latency × (3 + concurrency / 128)` seconds (minimum 300 s). If the budget is exceeded, the **entire level is discarded** (no partial results are mixed into the report) and in-flight requests are drained before the next level starts, so discarded levels cannot pollute the following measurements.
 - **Connection pool**: the HTTP connection pool is sized to the highest concurrency level under test, so high-concurrency requests are not queued client-side.
 
@@ -122,8 +126,8 @@ N = C_max × (1 + T_think / L_mean)
 | Parameter | Default | Adjustable |
 |-----------|---------|------------|
 | TTFT SLO | 1000 ms | Yes (sidebar) |
-| TPS SLO | 15 tokens/s | Yes (sidebar) |
-| Percentile | P90 | Yes (P90 or Mean) |
+| TPS SLO | 20 tokens/s | Yes (sidebar) |
+| Percentile | Mean | Yes (Mean or P90) |
 | Think Time | 45 s | Yes (1–600 s) |
 
 ### SLO Rationale
@@ -140,7 +144,9 @@ In LLM streaming scenarios, TTFT under 1 second ensures the user perceives the s
 
 > Miller, R. B. (1968). "Response time in man-computer conversational transactions." *Proc. AFIPS Fall Joint Computer Conference*, Vol. 33, 267-277.
 
-**TPS SLO = 15 tokens/s**
+**TPS SLO = 20 tokens/s**
+
+The default leaves a margin above the ~15 tok/s visual reading speed explained below.
 
 Based on human reading speed research ([Wikipedia: Speed reading](https://en.wikipedia.org/wiki/Speed_reading), Rayner et al. 2016):
 
@@ -177,17 +183,18 @@ Constants can be modified at the top of `benchmark.py`:
 | `MEASURED_ROUNDS` | 10 | Measured rounds per concurrency level |
 | `WARMUP_ROUNDS` | 1 | Warmup rounds per concurrency level (results discarded) |
 | `DEFAULT_TTFT_SLO` | 1000 | TTFT threshold (ms) |
-| `DEFAULT_TPS_SLO` | 15 | TPS threshold (tokens/s) |
+| `DEFAULT_TPS_SLO` | 20 | TPS threshold (tokens/s) |
 | `DEFAULT_THINK_TIME` | 45 | Think time (seconds) |
 | `REQUEST_TIMEOUT` | 50 | Request timeout (seconds) |
-| `MAX_RETRIES` | 1 | Transport-level retries allowed per request |
+| `MAX_RETRIES` | 0 | Transport-level retries allowed per request |
+| `DEFAULT_SEED` | 0 | Fixed seed for prompt order and padding, so every run sends the same prompts |
 
 ## Project Structure
 
 ```
 llm_benchmark/
 ├── benchmark.py        # Main application (Streamlit UI + benchmark logic)
-├── prompts.txt         # 100 diverse test prompts (auto-shuffled)
+├── prompts.txt         # 100 diverse test prompts (shuffled with the seed)
 ├── requirements.txt    # Python dependencies
 ├── images/
 │   └── CORDATUS_LOGO.png
