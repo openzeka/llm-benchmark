@@ -1,0 +1,7 @@
+httpx
+kaleido
+openai
+pandas
+plotly
+requests
+streamlit
