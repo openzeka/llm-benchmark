@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="images/CORDATUS_LOGO.png" alt="Cordatus" width="300"/>
+  <img src="images/OPENZEKA_LOGO.png" alt="OpenZeka" width="300"/>
 </div>
 
 # LLM Benchmark Tool
@@ -197,7 +197,7 @@ llm_benchmark/
 ├── prompts.txt         # 100 diverse test prompts (shuffled with the seed)
 ├── requirements.txt    # Python dependencies
 ├── images/
-│   └── CORDATUS_LOGO.png
+│   └── OPENZEKA_LOGO.png
 └── out/                # Output directory (gitignored)
 ```
 
